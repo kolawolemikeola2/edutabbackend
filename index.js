@@ -133,17 +133,18 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       const plan = getPlanDetails(plan_type);
       const planTier = plan?.tier || 'starter';
 
+      // ✅ FIX: Only use columns that exist in your table
       const subscriptionData = {
         child_id: child_id,
         parent_id: parent_id,
-        plan_type: plan_type,
-        plan_tier: planTier,
-        age_group: ageGroup,
+        plan_type: plan_type,  // ✅ This is the column that exists
         status: 'active',
         updated_at: new Date().toISOString(),
-        stripe_subscription_id: session.subscription,
+        // ✅ Removed: plan_tier, age_group (they may not exist)
+        // ✅ Removed: stripe_subscription_id (may not exist)
       };
       
+      // Check if subscription exists
       const { data: existing } = await supabase
         .from('child_subscriptions')
         .select('id')
@@ -156,6 +157,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
       console.log('📝 Upserting subscription data:', subscriptionData);
 
+      // Update or insert subscription
       const { data, error } = await supabase
         .from('child_subscriptions')
         .upsert(subscriptionData)
@@ -168,6 +170,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
       console.log('✅ Subscription updated successfully:', data);
 
+      // Create notification for parent
       const planName = plan?.name || plan_type;
       const { error: notifError } = await supabase
         .from('parent_notifications')
@@ -215,11 +218,13 @@ app.use(express.json());
 
 // ─── HEALTH CHECK ──────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
+  const isLive = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live');
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'development',
-    stripeMode: process.env.STRIPE_SECRET_KEY?.startsWith('sk_live') ? 'LIVE' : 'TEST',
+    stripeMode: isLive ? 'LIVE' : 'TEST',
+    currency: 'GBP (£)',
     plans: Object.keys(PLANS),
   });
 });
@@ -235,6 +240,7 @@ app.post('/api/create-checkout', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    // Get child's age to determine age group
     const { data: child, error: childError } = await supabase
       .from('children')
       .select('age')
@@ -249,11 +255,13 @@ app.post('/api/create-checkout', async (req, res) => {
     const age = child?.age || 0;
     const ageGroup = age <= 10 ? 'young' : 'older';
 
+    // Get plan details
     const plan = getPlanDetails(planType);
     if (!plan) {
       return res.status(400).json({ error: 'Invalid plan type' });
     }
 
+    // Check if plan is age-appropriate
     const isAgeAppropriate = 
       (ageGroup === 'young' && ['starter', 'premium', 'elite'].includes(planType)) ||
       (ageGroup === 'older' && ['premium_older', 'elite_older'].includes(planType));
@@ -269,14 +277,13 @@ app.post('/api/create-checkout', async (req, res) => {
       const trialEnd = new Date();
       trialEnd.setDate(trialEnd.getDate() + 7);
 
+      // ✅ FIX: Only use columns that exist
       const { error } = await supabase
         .from('child_subscriptions')
         .upsert({
           child_id: childId,
           parent_id: parentId,
-          plan_type: planType,
-          plan_tier: plan.tier,
-          age_group: ageGroup,
+          plan_type: planType,  // ✅ This column exists
           status: 'trial',
           trial_start_date: new Date().toISOString(),
           trial_end_date: trialEnd.toISOString(),
@@ -305,6 +312,7 @@ app.post('/api/create-checkout', async (req, res) => {
     const appScheme = isDevelopment ? 'exp' : 'edutab';
 
     // ─── CREATE STRIPE CHECKOUT SESSION ──────────────────────────────
+    // ✅ FIX: Removed payment_intent_data (not allowed in subscription mode)
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [{
@@ -319,7 +327,7 @@ app.post('/api/create-checkout', async (req, res) => {
         },
         quantity: 1,
       }],
-      mode: 'subscription',
+      mode: 'subscription',  // ✅ This is subscription mode
       success_url: `${appScheme}://payment-success?child_id=${childId}&plan=${planType}`,
       cancel_url: `${appScheme}://payment-cancelled`,
       customer_email: parentEmail,
@@ -331,10 +339,7 @@ app.post('/api/create-checkout', async (req, res) => {
         age_group: ageGroup,
         plan_tier: plan.tier,
       },
-      // Force live mode
-      payment_intent_data: {
-        capture_method: 'automatic',
-      },
+      // ✅ REMOVED: payment_intent_data (causes error in subscription mode)
     });
 
     console.log(`✅ Checkout session created: ${session.id} (${isLiveMode ? 'LIVE' : 'TEST'})`);
@@ -367,14 +372,14 @@ app.get('/api/verify-payment/:childId', async (req, res) => {
       throw error;
     }
     
+    // Check if subscription exists or return default
     const subscription = data || { 
       plan_type: 'starter', 
       status: 'active',
       child_id: childId,
-      age_group: 'young',
-      plan_tier: 'starter',
     };
     
+    // Check if trial is still valid
     let isTrial = false;
     let trialDaysLeft = 0;
     
@@ -387,6 +392,7 @@ app.get('/api/verify-payment/:childId', async (req, res) => {
         isTrial = true;
         trialDaysLeft = daysLeft;
       } else {
+        // Trial expired - update status
         await supabase
           .from('child_subscriptions')
           .update({ 
@@ -429,6 +435,7 @@ app.get('/api/child-subscription/:childId', async (req, res) => {
       throw error;
     }
     
+    // Map legacy plan types
     let subscription = data || { plan_type: 'starter', status: 'active' };
     if (LEGACY_MAP[subscription.plan_type]) {
       subscription.plan_type = LEGACY_MAP[subscription.plan_type];
@@ -456,6 +463,7 @@ app.get('/api/parent-subscriptions/:parentId', async (req, res) => {
     
     if (error) throw error;
     
+    // Map legacy plan types
     const subscriptions = (data || []).map(sub => {
       if (LEGACY_MAP[sub.plan_type]) {
         return { ...sub, plan_type: LEGACY_MAP[sub.plan_type] };
@@ -518,7 +526,6 @@ app.listen(PORT, () => {
   console.log(`✅ Health check: https://edutabbackend.onrender.com/health`);
   console.log(`📋 Plans: https://edutabbackend.onrender.com/api/plans\n`);
 });
-
 
 
 
