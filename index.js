@@ -30,9 +30,11 @@ const PLANS = {
     currency: 'gbp',
     description: 'Games + 7-day trial for worksheets & recorded videos',
     tier: 'starter',
-    requiresPayment: false,
+    requiresPayment: true,  // ✅ FIXED: Now true
     ageGroup: 'young',
     priceDisplay: '£4.99',
+    hasWorkbookTrial: true,  // ✅ This is the 7-day trial feature
+    trialDays: 7,
   },
   premium: {
     id: 'premium',
@@ -44,6 +46,7 @@ const PLANS = {
     requiresPayment: true,
     ageGroup: 'young',
     priceDisplay: '£12.99',
+    hasWorkbookTrial: false,
   },
   elite: {
     id: 'elite',
@@ -55,6 +58,7 @@ const PLANS = {
     requiresPayment: true,
     ageGroup: 'young',
     priceDisplay: '£30.99',
+    hasWorkbookTrial: false,
   },
   premium_older: {
     id: 'premium_older',
@@ -66,6 +70,7 @@ const PLANS = {
     requiresPayment: true,
     ageGroup: 'older',
     priceDisplay: '£50.00',
+    hasWorkbookTrial: false,
   },
   elite_older: {
     id: 'elite_older',
@@ -77,6 +82,7 @@ const PLANS = {
     requiresPayment: true,
     ageGroup: 'older',
     priceDisplay: '£70.00',
+    hasWorkbookTrial: false,
   },
 };
 
@@ -132,18 +138,29 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
       const plan = getPlanDetails(plan_type);
       const planTier = plan?.tier || 'starter';
+      
+      // Check if this plan has workbook trial
+      const hasWorkbookTrial = plan?.hasWorkbookTrial || false;
+      const trialDays = plan?.trialDays || 0;
 
-      // ✅ FIX: Only use columns that exist in your table
+      // Build subscription data
       const subscriptionData = {
         child_id: child_id,
         parent_id: parent_id,
-        plan_type: plan_type,  // ✅ This is the column that exists
+        plan_type: plan_type,
         status: 'active',
         updated_at: new Date().toISOString(),
-        // ✅ Removed: plan_tier, age_group (they may not exist)
-        // ✅ Removed: stripe_subscription_id (may not exist)
       };
-      
+
+      // Add workbook trial if applicable
+      if (hasWorkbookTrial) {
+        const trialEnd = new Date();
+        trialEnd.setDate(trialEnd.getDate() + trialDays);
+        subscriptionData.workbook_trial_active = true;
+        subscriptionData.trial_start_date = new Date().toISOString();
+        subscriptionData.trial_end_date = trialEnd.toISOString();
+      }
+
       // Check if subscription exists
       const { data: existing } = await supabase
         .from('child_subscriptions')
@@ -172,12 +189,18 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
       // Create notification for parent
       const planName = plan?.name || plan_type;
+      let message = `${planName} plan has been activated for ${child_name || 'your child'}!`;
+      
+      if (hasWorkbookTrial) {
+        message += ` You have ${trialDays} days of free workbook access!`;
+      }
+
       const { error: notifError } = await supabase
         .from('parent_notifications')
         .insert({
           user_id: parent_id,
           title: '🎉 Subscription Activated!',
-          message: `${planName} plan has been activated for ${child_name || 'your child'}!`,
+          message: message,
           type: 'subscription',
           created_at: new Date().toISOString(),
         });
@@ -272,34 +295,9 @@ app.post('/api/create-checkout', async (req, res) => {
       });
     }
 
-    // Starter plan - free trial
-    if (!plan.requiresPayment || planType === 'starter') {
-      const trialEnd = new Date();
-      trialEnd.setDate(trialEnd.getDate() + 7);
-
-      // ✅ FIX: Only use columns that exist
-      const { error } = await supabase
-        .from('child_subscriptions')
-        .upsert({
-          child_id: childId,
-          parent_id: parentId,
-          plan_type: planType,  // ✅ This column exists
-          status: 'trial',
-          trial_start_date: new Date().toISOString(),
-          trial_end_date: trialEnd.toISOString(),
-          workbook_trial_active: true,
-          start_date: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        });
-
-      if (error) {
-        console.error('Error updating starter plan:', error);
-        return res.status(500).json({ error: error.message });
-      }
-
-      return res.json({ success: true, planType: 'starter' });
-    }
-
+    // ✅ FIXED: All plans now require payment
+    // ALL plans go through Stripe - no more free trial bypass
+    
     // ─── STRIPE LIVE MODE CHECK ──────────────────────────────────────
     const isLiveMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live');
     console.log(`🔑 Stripe mode: ${isLiveMode ? 'LIVE' : 'TEST'}`);
@@ -312,7 +310,6 @@ app.post('/api/create-checkout', async (req, res) => {
     const appScheme = isDevelopment ? 'exp' : 'edutab';
 
     // ─── CREATE STRIPE CHECKOUT SESSION ──────────────────────────────
-    // ✅ FIX: Removed payment_intent_data (not allowed in subscription mode)
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [{
@@ -327,7 +324,7 @@ app.post('/api/create-checkout', async (req, res) => {
         },
         quantity: 1,
       }],
-      mode: 'subscription',  // ✅ This is subscription mode
+      mode: 'subscription',
       success_url: `${appScheme}://payment-success?child_id=${childId}&plan=${planType}`,
       cancel_url: `${appScheme}://payment-cancelled`,
       customer_email: parentEmail,
@@ -338,17 +335,21 @@ app.post('/api/create-checkout', async (req, res) => {
         child_name: childName,
         age_group: ageGroup,
         plan_tier: plan.tier,
+        has_workbook_trial: plan.hasWorkbookTrial ? 'true' : 'false',
+        trial_days: String(plan.trialDays || 0),
       },
-      // ✅ REMOVED: payment_intent_data (causes error in subscription mode)
     });
 
     console.log(`✅ Checkout session created: ${session.id} (${isLiveMode ? 'LIVE' : 'TEST'})`);
     console.log(`🔗 Checkout URL: ${session.url}`);
 
+    // ✅ FIXED: Always return a URL for all plans
     res.json({ 
       success: true, 
       url: session.url,
       mode: isLiveMode ? 'live' : 'test',
+      planType: planType,
+      hasWorkbookTrial: plan.hasWorkbookTrial || false,
     });
 
   } catch (error) {
@@ -379,17 +380,17 @@ app.get('/api/verify-payment/:childId', async (req, res) => {
       child_id: childId,
     };
     
-    // Check if trial is still valid
-    let isTrial = false;
+    // Check if workbook trial is still valid
+    let isWorkbookTrial = false;
     let trialDaysLeft = 0;
     
-    if (subscription.trial_end_date && subscription.workbook_trial_active) {
+    if (subscription.workbook_trial_active && subscription.trial_end_date) {
       const now = new Date();
       const end = new Date(subscription.trial_end_date);
       const daysLeft = Math.ceil((end - now) / (1000 * 60 * 60 * 24));
       
       if (daysLeft > 0) {
-        isTrial = true;
+        isWorkbookTrial = true;
         trialDaysLeft = daysLeft;
       } else {
         // Trial expired - update status
@@ -397,7 +398,6 @@ app.get('/api/verify-payment/:childId', async (req, res) => {
           .from('child_subscriptions')
           .update({ 
             workbook_trial_active: false,
-            status: 'active'
           })
           .eq('child_id', childId);
       }
@@ -409,7 +409,7 @@ app.get('/api/verify-payment/:childId', async (req, res) => {
       success: true, 
       subscription: {
         ...subscription,
-        isTrial,
+        isWorkbookTrial,
         trialDaysLeft,
         planDetails: plan,
       }
@@ -526,6 +526,538 @@ app.listen(PORT, () => {
   console.log(`✅ Health check: https://edutabbackend.onrender.com/health`);
   console.log(`📋 Plans: https://edutabbackend.onrender.com/api/plans\n`);
 });
+
+
+
+
+// const express = require('express');
+// const cors = require('cors');
+// const Stripe = require('stripe');
+// const { createClient } = require('@supabase/supabase-js');
+// require('dotenv').config();
+
+// const app = express();
+// const PORT = process.env.PORT || 3000;
+
+// // Initialize Stripe with live key
+// const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+//   apiVersion: '2025-02-24.acacia',
+// });
+
+// // Initialize Supabase
+// const supabase = createClient(
+//   process.env.SUPABASE_URL,
+//   process.env.SUPABASE_SERVICE_ROLE_KEY
+// );
+
+// // Enable CORS
+// app.use(cors());
+
+// // ─── PLAN DEFINITIONS (Pricing in GBP £) ──────────────────────────────────
+// const PLANS = {
+//   starter: {
+//     id: 'starter',
+//     name: 'Starter',
+//     price: 499,      // £4.99 in pence
+//     currency: 'gbp',
+//     description: 'Games + 7-day trial for worksheets & recorded videos',
+//     tier: 'starter',
+//     requiresPayment: false,
+//     ageGroup: 'young',
+//     priceDisplay: '£4.99',
+//   },
+//   premium: {
+//     id: 'premium',
+//     name: 'Premium',
+//     price: 1299,     // £12.99 in pence
+//     currency: 'gbp',
+//     description: 'Games, worksheets, recorded sessions + AI Assistant',
+//     tier: 'premium',
+//     requiresPayment: true,
+//     ageGroup: 'young',
+//     priceDisplay: '£12.99',
+//   },
+//   elite: {
+//     id: 'elite',
+//     name: 'Elite',
+//     price: 3099,     // £30.99 in pence
+//     currency: 'gbp',
+//     description: 'Everything in Premium + Live sessions + Exam support + Readers Club',
+//     tier: 'elite',
+//     requiresPayment: true,
+//     ageGroup: 'young',
+//     priceDisplay: '£30.99',
+//   },
+//   premium_older: {
+//     id: 'premium_older',
+//     name: 'Premium 11+',
+//     price: 5000,     // £50.00 in pence
+//     currency: 'gbp',
+//     description: 'Maths, English, Science + Ethics & Values + 2 LIVE sessions/week',
+//     tier: 'premium',
+//     requiresPayment: true,
+//     ageGroup: 'older',
+//     priceDisplay: '£50.00',
+//   },
+//   elite_older: {
+//     id: 'elite_older',
+//     name: 'Elite 11+',
+//     price: 7000,     // £70.00 in pence
+//     currency: 'gbp',
+//     description: 'Everything in Premium 11+ + Reading groups + Discussion groups + Exam prep',
+//     tier: 'elite',
+//     requiresPayment: true,
+//     ageGroup: 'older',
+//     priceDisplay: '£70.00',
+//   },
+// };
+
+// // ─── LEGACY PLAN MAPPING ──────────────────────────────────────────────────
+// const LEGACY_MAP = {
+//   'free': 'starter',
+//   'premium': 'premium',
+//   'elite': 'elite',
+// };
+
+// const getPlanDetails = (planType) => {
+//   const mappedId = LEGACY_MAP[planType] || planType;
+//   return PLANS[mappedId] || null;
+// };
+
+// // ─── WEBHOOK ──────────────────────────────────────────────────────────────
+// app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+//   const sig = req.headers['stripe-signature'];
+//   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+//   console.log('📨 Webhook received - signature present:', !!sig);
+//   console.log('🔐 Webhook secret present:', !!webhookSecret);
+
+//   if (!webhookSecret) {
+//     console.error('❌ Missing STRIPE_WEBHOOK_SECRET');
+//     return res.status(500).send('Webhook secret not configured');
+//   }
+
+//   if (!sig) {
+//     console.error('❌ No stripe-signature header');
+//     return res.status(400).send('No signature header');
+//   }
+
+//   try {
+//     const event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+//     console.log('✅ Webhook event type:', event.type);
+
+//     if (event.type === 'checkout.session.completed') {
+//       const session = event.data.object;
+//       const { child_id, parent_id, plan_type, child_name, age_group } = session.metadata;
+
+//       console.log(`💰 Processing payment for child: ${child_id}, plan: ${plan_type}`);
+
+//       let ageGroup = age_group;
+//       if (!ageGroup) {
+//         const { data: child } = await supabase
+//           .from('children')
+//           .select('age')
+//           .eq('id', child_id)
+//           .single();
+//         ageGroup = (child?.age || 0) <= 10 ? 'young' : 'older';
+//       }
+
+//       const plan = getPlanDetails(plan_type);
+//       const planTier = plan?.tier || 'starter';
+
+//       // ✅ FIX: Only use columns that exist in your table
+//       const subscriptionData = {
+//         child_id: child_id,
+//         parent_id: parent_id,
+//         plan_type: plan_type,  // ✅ This is the column that exists
+//         status: 'active',
+//         updated_at: new Date().toISOString(),
+//         // ✅ Removed: plan_tier, age_group (they may not exist)
+//         // ✅ Removed: stripe_subscription_id (may not exist)
+//       };
+      
+//       // Check if subscription exists
+//       const { data: existing } = await supabase
+//         .from('child_subscriptions')
+//         .select('id')
+//         .eq('child_id', child_id)
+//         .maybeSingle();
+        
+//       if (!existing) {
+//         subscriptionData.start_date = new Date().toISOString();
+//       }
+
+//       console.log('📝 Upserting subscription data:', subscriptionData);
+
+//       // Update or insert subscription
+//       const { data, error } = await supabase
+//         .from('child_subscriptions')
+//         .upsert(subscriptionData)
+//         .select();
+
+//       if (error) {
+//         console.error('❌ Supabase upsert error:', error);
+//         return res.status(500).json({ error: error.message });
+//       }
+
+//       console.log('✅ Subscription updated successfully:', data);
+
+//       // Create notification for parent
+//       const planName = plan?.name || plan_type;
+//       const { error: notifError } = await supabase
+//         .from('parent_notifications')
+//         .insert({
+//           user_id: parent_id,
+//           title: '🎉 Subscription Activated!',
+//           message: `${planName} plan has been activated for ${child_name || 'your child'}!`,
+//           type: 'subscription',
+//           created_at: new Date().toISOString(),
+//         });
+
+//       if (notifError) {
+//         console.error('⚠️ Error creating notification:', notifError);
+//       } else {
+//         console.log('✅ Notification created for parent');
+//       }
+//     }
+
+//     if (event.type === 'customer.subscription.deleted') {
+//       const subscription = event.data.object;
+//       console.log(`❌ Processing subscription cancellation: ${subscription.id}`);
+      
+//       const { error } = await supabase
+//         .from('child_subscriptions')
+//         .update({ 
+//           status: 'cancelled',
+//           updated_at: new Date().toISOString()
+//         })
+//         .eq('stripe_subscription_id', subscription.id);
+
+//       if (error) {
+//         console.error('⚠️ Error updating cancelled subscription:', error);
+//       }
+//     }
+
+//     res.json({ received: true });
+//   } catch (err) {
+//     console.error('❌ Webhook error:', err.message);
+//     return res.status(400).send(`Webhook Error: ${err.message}`);
+//   }
+// });
+
+// // ─── MIDDLEWARE ──────────────────────────────────────────────────────────
+// app.use(express.json());
+
+// // ─── HEALTH CHECK ──────────────────────────────────────────────────────
+// app.get('/health', (req, res) => {
+//   const isLive = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live');
+//   res.json({ 
+//     status: 'ok', 
+//     timestamp: new Date().toISOString(),
+//     environment: process.env.NODE_ENV || 'development',
+//     stripeMode: isLive ? 'LIVE' : 'TEST',
+//     currency: 'GBP (£)',
+//     plans: Object.keys(PLANS),
+//   });
+// });
+
+// // ─── CREATE CHECKOUT SESSION ───────────────────────────────────────────
+// app.post('/api/create-checkout', async (req, res) => {
+//   try {
+//     const { childId, childName, planType, parentId, parentEmail, isDevelopment } = req.body;
+
+//     console.log('🚀 Creating checkout session for:', { childId, childName, planType, parentId, parentEmail });
+
+//     if (!childId || !childName || !planType || !parentId || !parentEmail) {
+//       return res.status(400).json({ error: 'Missing required fields' });
+//     }
+
+//     // Get child's age to determine age group
+//     const { data: child, error: childError } = await supabase
+//       .from('children')
+//       .select('age')
+//       .eq('id', childId)
+//       .single();
+
+//     if (childError) {
+//       console.error('Error fetching child age:', childError);
+//       return res.status(500).json({ error: 'Could not fetch child data' });
+//     }
+
+//     const age = child?.age || 0;
+//     const ageGroup = age <= 10 ? 'young' : 'older';
+
+//     // Get plan details
+//     const plan = getPlanDetails(planType);
+//     if (!plan) {
+//       return res.status(400).json({ error: 'Invalid plan type' });
+//     }
+
+//     // Check if plan is age-appropriate
+//     const isAgeAppropriate = 
+//       (ageGroup === 'young' && ['starter', 'premium', 'elite'].includes(planType)) ||
+//       (ageGroup === 'older' && ['premium_older', 'elite_older'].includes(planType));
+
+//     if (!isAgeAppropriate) {
+//       return res.status(400).json({ 
+//         error: `This plan is not available for age group ${ageGroup}` 
+//       });
+//     }
+
+//     // Starter plan - free trial
+//     if (!plan.requiresPayment || planType === 'starter') {
+//       const trialEnd = new Date();
+//       trialEnd.setDate(trialEnd.getDate() + 7);
+
+//       // ✅ FIX: Only use columns that exist
+//       const { error } = await supabase
+//         .from('child_subscriptions')
+//         .upsert({
+//           child_id: childId,
+//           parent_id: parentId,
+//           plan_type: planType,  // ✅ This column exists
+//           status: 'trial',
+//           trial_start_date: new Date().toISOString(),
+//           trial_end_date: trialEnd.toISOString(),
+//           workbook_trial_active: true,
+//           start_date: new Date().toISOString(),
+//           updated_at: new Date().toISOString(),
+//         });
+
+//       if (error) {
+//         console.error('Error updating starter plan:', error);
+//         return res.status(500).json({ error: error.message });
+//       }
+
+//       return res.json({ success: true, planType: 'starter' });
+//     }
+
+//     // ─── STRIPE LIVE MODE CHECK ──────────────────────────────────────
+//     const isLiveMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live');
+//     console.log(`🔑 Stripe mode: ${isLiveMode ? 'LIVE' : 'TEST'}`);
+
+//     if (!isLiveMode) {
+//       console.warn('⚠️ WARNING: Running in TEST mode. Set STRIPE_SECRET_KEY to live key for production.');
+//     }
+
+//     // App scheme for deep linking
+//     const appScheme = isDevelopment ? 'exp' : 'edutab';
+
+//     // ─── CREATE STRIPE CHECKOUT SESSION ──────────────────────────────
+//     // ✅ FIX: Removed payment_intent_data (not allowed in subscription mode)
+//     const session = await stripe.checkout.sessions.create({
+//       payment_method_types: ['card'],
+//       line_items: [{
+//         price_data: {
+//           currency: plan.currency || 'gbp',
+//           product_data: {
+//             name: `${plan.name} - ${childName}`,
+//             description: `${plan.description} for ${childName} (${ageGroup === 'young' ? 'Ages 3-10' : 'Ages 11+'})`,
+//           },
+//           unit_amount: plan.price,
+//           recurring: { interval: 'month' },
+//         },
+//         quantity: 1,
+//       }],
+//       mode: 'subscription',  // ✅ This is subscription mode
+//       success_url: `${appScheme}://payment-success?child_id=${childId}&plan=${planType}`,
+//       cancel_url: `${appScheme}://payment-cancelled`,
+//       customer_email: parentEmail,
+//       metadata: {
+//         child_id: childId,
+//         parent_id: parentId,
+//         plan_type: planType,
+//         child_name: childName,
+//         age_group: ageGroup,
+//         plan_tier: plan.tier,
+//       },
+//       // ✅ REMOVED: payment_intent_data (causes error in subscription mode)
+//     });
+
+//     console.log(`✅ Checkout session created: ${session.id} (${isLiveMode ? 'LIVE' : 'TEST'})`);
+//     console.log(`🔗 Checkout URL: ${session.url}`);
+
+//     res.json({ 
+//       success: true, 
+//       url: session.url,
+//       mode: isLiveMode ? 'live' : 'test',
+//     });
+
+//   } catch (error) {
+//     console.error('❌ Error creating checkout session:', error);
+//     res.status(400).json({ error: error.message });
+//   }
+// });
+
+// // ─── VERIFY PAYMENT ──────────────────────────────────────────────────────
+// app.get('/api/verify-payment/:childId', async (req, res) => {
+//   try {
+//     const { childId } = req.params;
+    
+//     const { data, error } = await supabase
+//       .from('child_subscriptions')
+//       .select('*')
+//       .eq('child_id', childId)
+//       .maybeSingle();
+    
+//     if (error && error.code !== 'PGRST116') {
+//       throw error;
+//     }
+    
+//     // Check if subscription exists or return default
+//     const subscription = data || { 
+//       plan_type: 'starter', 
+//       status: 'active',
+//       child_id: childId,
+//     };
+    
+//     // Check if trial is still valid
+//     let isTrial = false;
+//     let trialDaysLeft = 0;
+    
+//     if (subscription.trial_end_date && subscription.workbook_trial_active) {
+//       const now = new Date();
+//       const end = new Date(subscription.trial_end_date);
+//       const daysLeft = Math.ceil((end - now) / (1000 * 60 * 60 * 24));
+      
+//       if (daysLeft > 0) {
+//         isTrial = true;
+//         trialDaysLeft = daysLeft;
+//       } else {
+//         // Trial expired - update status
+//         await supabase
+//           .from('child_subscriptions')
+//           .update({ 
+//             workbook_trial_active: false,
+//             status: 'active'
+//           })
+//           .eq('child_id', childId);
+//       }
+//     }
+    
+//     const plan = getPlanDetails(subscription.plan_type);
+    
+//     res.json({ 
+//       success: true, 
+//       subscription: {
+//         ...subscription,
+//         isTrial,
+//         trialDaysLeft,
+//         planDetails: plan,
+//       }
+//     });
+//   } catch (error) {
+//     console.error('❌ Verify payment error:', error);
+//     res.status(400).json({ success: false, error: error.message });
+//   }
+// });
+
+// // ─── GET CHILD SUBSCRIPTION ────────────────────────────────────────────
+// app.get('/api/child-subscription/:childId', async (req, res) => {
+//   try {
+//     const { childId } = req.params;
+    
+//     const { data, error } = await supabase
+//       .from('child_subscriptions')
+//       .select('*')
+//       .eq('child_id', childId)
+//       .maybeSingle();
+    
+//     if (error && error.code !== 'PGRST116') {
+//       throw error;
+//     }
+    
+//     // Map legacy plan types
+//     let subscription = data || { plan_type: 'starter', status: 'active' };
+//     if (LEGACY_MAP[subscription.plan_type]) {
+//       subscription.plan_type = LEGACY_MAP[subscription.plan_type];
+//     }
+    
+//     res.json({ 
+//       success: true, 
+//       subscription: subscription 
+//     });
+//   } catch (error) {
+//     console.error('❌ Error fetching subscription:', error);
+//     res.status(400).json({ success: false, error: error.message });
+//   }
+// });
+
+// // ─── GET PARENT SUBSCRIPTIONS ──────────────────────────────────────────
+// app.get('/api/parent-subscriptions/:parentId', async (req, res) => {
+//   try {
+//     const { parentId } = req.params;
+    
+//     const { data, error } = await supabase
+//       .from('child_subscriptions')
+//       .select('*')
+//       .eq('parent_id', parentId);
+    
+//     if (error) throw error;
+    
+//     // Map legacy plan types
+//     const subscriptions = (data || []).map(sub => {
+//       if (LEGACY_MAP[sub.plan_type]) {
+//         return { ...sub, plan_type: LEGACY_MAP[sub.plan_type] };
+//       }
+//       return sub;
+//     });
+    
+//     res.json({ success: true, subscriptions: subscriptions || [] });
+//   } catch (error) {
+//     console.error('❌ Error fetching parent subscriptions:', error);
+//     res.status(400).json({ success: false, error: error.message });
+//   }
+// });
+
+// // ─── GET ALL PLANS ──────────────────────────────────────────────────────
+// app.get('/api/plans', (req, res) => {
+//   res.json({ 
+//     success: true, 
+//     plans: Object.values(PLANS),
+//     legacyMapping: LEGACY_MAP,
+//     currency: 'GBP (£)',
+//   });
+// });
+
+// // ─── GET PLANS FOR AGE GROUP ───────────────────────────────────────────
+// app.get('/api/plans/:ageGroup', (req, res) => {
+//   const { ageGroup } = req.params;
+  
+//   const filteredPlans = Object.values(PLANS).filter(
+//     plan => plan.ageGroup === ageGroup
+//   );
+  
+//   res.json({ 
+//     success: true, 
+//     ageGroup,
+//     plans: filteredPlans,
+//     currency: 'GBP (£)',
+//   });
+// });
+
+// // ─── 404 HANDLER ────────────────────────────────────────────────────────
+// app.use((req, res) => {
+//   res.status(404).json({ error: 'Route not found' });
+// });
+
+// // ─── ERROR HANDLER ──────────────────────────────────────────────────────
+// app.use((err, req, res, next) => {
+//   console.error('❌ Server error:', err);
+//   res.status(500).json({ error: 'Internal server error' });
+// });
+
+// // ─── START SERVER ──────────────────────────────────────────────────────
+// app.listen(PORT, () => {
+//   const isLive = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live');
+//   console.log(`\n🚀 Server running on port ${PORT}`);
+//   console.log(`💰 Stripe mode: ${isLive ? '🔴 LIVE' : '🧪 TEST'}`);
+//   console.log(`💷 Currency: GBP (£)`);
+//   console.log(`📡 Webhook endpoint: https://edutabbackend.onrender.com/webhook`);
+//   console.log(`💳 Create checkout: https://edutabbackend.onrender.com/api/create-checkout`);
+//   console.log(`✅ Health check: https://edutabbackend.onrender.com/health`);
+//   console.log(`📋 Plans: https://edutabbackend.onrender.com/api/plans\n`);
+// });
 
 
 
