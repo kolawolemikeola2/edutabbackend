@@ -2,6 +2,9 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
+const { Resend } = require('resend');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 require('dotenv').config();
 
 const app = express();
@@ -18,8 +21,12 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Enable CORS
-app.use(cors());
+// ─── RESEND EMAIL ──────────────────────────────────────────────────────────
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+// ─── VERIFICATION CODES STORE ─────────────────────────────────────────────
+// In production, use Redis or database. This is for demo only.
+const verificationCodes = new Map();
 
 // ─── PLAN DEFINITIONS (Pricing in GBP £) ──────────────────────────────────
 const PLANS = {
@@ -139,11 +146,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       const plan = getPlanDetails(plan_type);
       const planTier = plan?.tier || 'starter';
       
-      // Check if this plan has workbook trial
       const hasWorkbookTrial = plan?.hasWorkbookTrial || false;
       const trialDays = plan?.trialDays || 0;
 
-      // Build subscription data
       const subscriptionData = {
         child_id: child_id,
         parent_id: parent_id,
@@ -152,7 +157,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         updated_at: new Date().toISOString(),
       };
 
-      // Add workbook trial if applicable (ONLY for Starter plan)
       if (hasWorkbookTrial) {
         const trialEnd = new Date();
         trialEnd.setDate(trialEnd.getDate() + trialDays);
@@ -160,11 +164,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         subscriptionData.trial_start_date = new Date().toISOString();
         subscriptionData.trial_end_date = trialEnd.toISOString();
       } else {
-        // For other plans, no workbook trial
         subscriptionData.workbook_trial_active = false;
       }
 
-      // Check if subscription exists
       const { data: existing } = await supabase
         .from('child_subscriptions')
         .select('id')
@@ -177,7 +179,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
       console.log('📝 Upserting subscription data:', subscriptionData);
 
-      // Update or insert subscription
       const { data, error } = await supabase
         .from('child_subscriptions')
         .upsert(subscriptionData)
@@ -190,7 +191,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
       console.log('✅ Subscription updated successfully:', data);
 
-      // Create notification for parent
       const planName = plan?.name || plan_type;
       let message = `${planName} plan has been activated for ${child_name || 'your child'}!`;
       
@@ -266,7 +266,6 @@ app.post('/api/create-checkout', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Get child's age to determine age group
     const { data: child, error: childError } = await supabase
       .from('children')
       .select('age')
@@ -281,13 +280,11 @@ app.post('/api/create-checkout', async (req, res) => {
     const age = child?.age || 0;
     const ageGroup = age <= 10 ? 'young' : 'older';
 
-    // Get plan details
     const plan = getPlanDetails(planType);
     if (!plan) {
       return res.status(400).json({ error: 'Invalid plan type' });
     }
 
-    // Check if plan is age-appropriate
     const isAgeAppropriate = 
       (ageGroup === 'young' && ['starter', 'premium', 'elite'].includes(planType)) ||
       (ageGroup === 'older' && ['premium_older', 'elite_older'].includes(planType));
@@ -298,7 +295,6 @@ app.post('/api/create-checkout', async (req, res) => {
       });
     }
 
-    // ─── STRIPE LIVE MODE CHECK ──────────────────────────────────────
     const isLiveMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live');
     console.log(`🔑 Stripe mode: ${isLiveMode ? 'LIVE' : 'TEST'}`);
 
@@ -306,15 +302,9 @@ app.post('/api/create-checkout', async (req, res) => {
       console.warn('⚠️ WARNING: Running in TEST mode. Set STRIPE_SECRET_KEY to live key for production.');
     }
 
-    // App scheme for deep linking
     const appScheme = isDevelopment ? 'exp' : 'edutab';
-
-    // ─── DEEP LINK TO PARENT DASHBOARD ──────────────────────────────
-    // THIS WORKS FOR ALL PLANS - returns to parent dashboard with context
     const parentDashboardUrl = `${appScheme}://parent-dashboard?parent_id=${parentId}&child_id=${childId}&plan=${planType}`;
 
-    // ─── CREATE STRIPE CHECKOUT SESSION ──────────────────────────────
-    // ALL PLANS go through Stripe - no exceptions
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [{
@@ -347,10 +337,7 @@ app.post('/api/create-checkout', async (req, res) => {
 
     console.log(`✅ Checkout session created: ${session.id} (${isLiveMode ? 'LIVE' : 'TEST'})`);
     console.log(`🔗 Checkout URL: ${session.url}`);
-    console.log(`🔗 Success/Cancel URL: ${parentDashboardUrl}`);
 
-    // ─── ALWAYS RETURN URL FOR ALL PLANS ─────────────────────────────
-    // Every plan (Starter, Premium, Elite, etc.) gets a URL
     res.json({ 
       success: true, 
       url: session.url,
@@ -386,14 +373,12 @@ app.get('/api/verify-payment/:childId', async (req, res) => {
       throw error;
     }
     
-    // Check if subscription exists or return default
     const subscription = data || { 
       plan_type: 'starter', 
       status: 'active',
       child_id: childId,
     };
     
-    // Check if workbook trial is still valid (ONLY for Starter)
     let isWorkbookTrial = false;
     let trialDaysLeft = 0;
     
@@ -406,7 +391,6 @@ app.get('/api/verify-payment/:childId', async (req, res) => {
         isWorkbookTrial = true;
         trialDaysLeft = daysLeft;
       } else {
-        // Trial expired - update status
         await supabase
           .from('child_subscriptions')
           .update({ 
@@ -448,7 +432,6 @@ app.get('/api/child-subscription/:childId', async (req, res) => {
       throw error;
     }
     
-    // Map legacy plan types
     let subscription = data || { plan_type: 'starter', status: 'active' };
     if (LEGACY_MAP[subscription.plan_type]) {
       subscription.plan_type = LEGACY_MAP[subscription.plan_type];
@@ -476,7 +459,6 @@ app.get('/api/parent-subscriptions/:parentId', async (req, res) => {
     
     if (error) throw error;
     
-    // Map legacy plan types
     const subscriptions = (data || []).map(sub => {
       if (LEGACY_MAP[sub.plan_type]) {
         return { ...sub, plan_type: LEGACY_MAP[sub.plan_type] };
@@ -517,6 +499,336 @@ app.get('/api/plans/:ageGroup', (req, res) => {
   });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// ─── FORGOT PASSWORD / RESEND EMAIL ENDPOINTS ─────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── SEND VERIFICATION CODE ──────────────────────────────────────────────
+app.post('/api/send-verification-code', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    // Check if user exists in Supabase
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('id, email, full_name')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (userError) {
+      console.error('Error checking user:', userError);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!user) {
+      return res.status(404).json({ error: 'No account found with this email' });
+    }
+
+    // Generate 6-digit verification code
+    const code = crypto.randomInt(100000, 999999).toString();
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes expiry
+
+    // Store code
+    verificationCodes.set(email, {
+      code,
+      expiresAt,
+      userId: user.id,
+      attempts: 0,
+      verified: false,
+    });
+
+    console.log(`📧 Verification code for ${email}: ${code}`);
+
+    // ─── SEND EMAIL WITH RESEND ────────────────────────────────────────
+    try {
+      const { data, error } = await resend.emails.send({
+        from: process.env.RESEND_FROM_EMAIL || 'Edutab <noreply@edutab.com>',
+        to: [email],
+        subject: '🔐 Edutab Password Reset Code',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f8f9fa; border-radius: 12px;">
+            <div style="text-align: center; margin-bottom: 20px;">
+              <h1 style="color: #006a62; font-size: 24px;">🔐 Password Reset</h1>
+            </div>
+            <div style="background-color: white; padding: 30px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+              <p style="color: #333; font-size: 16px; margin-bottom: 20px;">
+                Hi ${user.full_name || 'there'},
+              </p>
+              <p style="color: #555; font-size: 14px; margin-bottom: 20px;">
+                You requested to reset your password for your Edutab account. Use the verification code below to proceed:
+              </p>
+              <div style="text-align: center; padding: 20px; background-color: #f0f7ff; border-radius: 8px; margin: 20px 0;">
+                <span style="font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #006a62;">
+                  ${code}
+                </span>
+              </div>
+              <p style="color: #666; font-size: 13px; margin-top: 20px;">
+                This code will expire in <strong>10 minutes</strong>.
+              </p>
+              <p style="color: #888; font-size: 12px; margin-top: 20px; border-top: 1px solid #eee; padding-top: 16px;">
+                If you didn't request this, please ignore this email or contact support.
+              </p>
+            </div>
+            <div style="text-align: center; margin-top: 20px;">
+              <p style="color: #999; font-size: 12px;">
+                © 2026 Edutab. All rights reserved.
+              </p>
+            </div>
+          </div>
+        `,
+      });
+
+      if (error) {
+        console.error('Resend error:', error);
+        return res.json({ 
+          success: true, 
+          message: 'Verification code sent (check console)',
+          devCode: code,
+        });
+      }
+
+      console.log('✅ Email sent successfully with Resend:', data?.id);
+
+      if (process.env.NODE_ENV === 'development') {
+        return res.json({ 
+          success: true, 
+          message: 'Verification code sent!',
+          devCode: code,
+        });
+      }
+
+      return res.json({ success: true, message: 'Verification code sent!' });
+
+    } catch (emailError) {
+      console.error('Email send error:', emailError);
+      return res.json({ 
+        success: true, 
+        message: 'Verification code sent (check console)',
+        devCode: code,
+      });
+    }
+
+  } catch (error) {
+    console.error('Send code error:', error);
+    res.status(500).json({ error: 'Failed to send verification code' });
+  }
+});
+
+// ─── VERIFY CODE ──────────────────────────────────────────────────────────
+app.post('/api/verify-code', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+      return res.status(400).json({ error: 'Email and code are required' });
+    }
+
+    const storedData = verificationCodes.get(email);
+
+    if (!storedData) {
+      return res.status(400).json({ error: 'No verification code found. Please request a new one.' });
+    }
+
+    if (Date.now() > storedData.expiresAt) {
+      verificationCodes.delete(email);
+      return res.status(400).json({ error: 'Verification code has expired. Please request a new one.' });
+    }
+
+    if (storedData.attempts >= 5) {
+      verificationCodes.delete(email);
+      return res.status(400).json({ error: 'Too many failed attempts. Please request a new code.' });
+    }
+
+    if (storedData.code !== code) {
+      storedData.attempts += 1;
+      verificationCodes.set(email, storedData);
+      return res.status(400).json({ 
+        error: 'Invalid verification code',
+        attemptsLeft: 5 - storedData.attempts,
+      });
+    }
+
+    storedData.verified = true;
+    verificationCodes.set(email, storedData);
+
+    res.json({ 
+      success: true, 
+      message: 'Code verified successfully!' 
+    });
+
+  } catch (error) {
+    console.error('Verify code error:', error);
+    res.status(500).json({ error: 'Failed to verify code' });
+  }
+});
+
+// ─── RESET PASSWORD ──────────────────────────────────────────────────────
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const storedData = verificationCodes.get(email);
+
+    if (!storedData) {
+      return res.status(400).json({ error: 'No verification code found. Please request a new one.' });
+    }
+
+    if (!storedData.verified) {
+      return res.status(400).json({ error: 'Code not verified. Please verify your code first.' });
+    }
+
+    if (Date.now() > storedData.expiresAt) {
+      verificationCodes.delete(email);
+      return res.status(400).json({ error: 'Verification code has expired. Please request a new one.' });
+    }
+
+    const salt = bcrypt.genSaltSync(10);
+    const hashedPassword = bcrypt.hashSync(newPassword, salt);
+
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ 
+        password_hash: hashedPassword,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('email', email);
+
+    if (updateError) {
+      console.error('Error updating password:', updateError);
+      return res.status(500).json({ error: 'Failed to update password' });
+    }
+
+    verificationCodes.delete(email);
+
+    res.json({ 
+      success: true, 
+      message: 'Password reset successfully!' 
+    });
+
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ error: 'Failed to reset password' });
+  }
+});
+
+// ─── RESEND VERIFICATION CODE ────────────────────────────────────────────
+app.post('/api/resend-verification-code', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('id, email, full_name')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (userError || !user) {
+      return res.status(404).json({ error: 'No account found with this email' });
+    }
+
+    const code = crypto.randomInt(100000, 999999).toString();
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+
+    verificationCodes.set(email, {
+      code,
+      expiresAt,
+      userId: user.id,
+      attempts: 0,
+      verified: false,
+    });
+
+    console.log(`📧 Resent verification code for ${email}: ${code}`);
+
+    try {
+      const { data, error } = await resend.emails.send({
+        from: process.env.RESEND_FROM_EMAIL || 'Edutab <noreply@edutab.com>',
+        to: [email],
+        subject: '🔐 Edutab Password Reset Code (Resent)',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f8f9fa; border-radius: 12px;">
+            <div style="text-align: center; margin-bottom: 20px;">
+              <h1 style="color: #006a62; font-size: 24px;">🔐 Password Reset</h1>
+            </div>
+            <div style="background-color: white; padding: 30px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+              <p style="color: #333; font-size: 16px; margin-bottom: 20px;">
+                Hi ${user.full_name || 'there'},
+              </p>
+              <p style="color: #555; font-size: 14px; margin-bottom: 20px;">
+                You requested a new verification code. Use the code below to reset your password:
+              </p>
+              <div style="text-align: center; padding: 20px; background-color: #f0f7ff; border-radius: 8px; margin: 20px 0;">
+                <span style="font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #006a62;">
+                  ${code}
+                </span>
+              </div>
+              <p style="color: #666; font-size: 13px; margin-top: 20px;">
+                This code will expire in <strong>10 minutes</strong>.
+              </p>
+              <p style="color: #888; font-size: 12px; margin-top: 20px; border-top: 1px solid #eee; padding-top: 16px;">
+                If you didn't request this, please ignore this email or contact support.
+              </p>
+            </div>
+            <div style="text-align: center; margin-top: 20px;">
+              <p style="color: #999; font-size: 12px;">
+                © 2026 Edutab. All rights reserved.
+              </p>
+            </div>
+          </div>
+        `,
+      });
+
+      if (error) {
+        console.error('Resend error:', error);
+        return res.json({ 
+          success: true, 
+          message: 'Verification code resent (check console)',
+          devCode: code,
+        });
+      }
+
+      console.log('✅ Resent email sent successfully with Resend:', data?.id);
+
+      if (process.env.NODE_ENV === 'development') {
+        return res.json({ 
+          success: true, 
+          message: 'Verification code resent!',
+          devCode: code,
+        });
+      }
+
+      return res.json({ success: true, message: 'Verification code resent!' });
+
+    } catch (emailError) {
+      console.error('Email send error:', emailError);
+      return res.json({ 
+        success: true, 
+        message: 'Verification code resent (check console)',
+        devCode: code,
+      });
+    }
+
+  } catch (error) {
+    console.error('Resend code error:', error);
+    res.status(500).json({ error: 'Failed to resend verification code' });
+  }
+});
+
 // ─── 404 HANDLER ────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
@@ -537,12 +849,9 @@ app.listen(PORT, () => {
   console.log(`📡 Webhook endpoint: https://edutabbackend.onrender.com/webhook`);
   console.log(`💳 Create checkout: https://edutabbackend.onrender.com/api/create-checkout`);
   console.log(`✅ Health check: https://edutabbackend.onrender.com/health`);
-  console.log(`📋 Plans: https://edutabbackend.onrender.com/api/plans\n`);
+  console.log(`📋 Plans: https://edutabbackend.onrender.com/api/plans`);
+  console.log(`🔐 Forgot Password endpoints: /api/send-verification-code, /api/verify-code, /api/reset-password\n`);
 });
-
-
-
-
 
 // const express = require('express');
 // const cors = require('cors');
