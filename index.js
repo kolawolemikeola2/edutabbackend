@@ -668,7 +668,7 @@ app.post('/api/verify-code', async (req, res) => {
 
 // ─── RESET PASSWORD ──────────────────────────────────────────────────────
 // ─── RESET PASSWORD USING SUPABASE AUTH ADMIN ──────────────────────────
-// ─── RESET PASSWORD - SUPPORTING BOTH HASHING METHODS ────────────────
+// ─── RESET PASSWORD - FORCE SHA-256 ALWAYS ──────────────────────────
 app.post('/api/reset-password', async (req, res) => {
   try {
     const { email, code, newPassword } = req.body;
@@ -696,40 +696,14 @@ app.post('/api/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'Verification code has expired. Please request a new one.' });
     }
 
-    // Check what hashing method the user's current password uses
-    const { data: user, error: userError } = await supabase
-      .from('users')
-      .select('password_hash')
-      .eq('email', email)
-      .single();
-
-    if (userError || !user) {
-      console.error('❌ User not found:', userError);
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    let hashedPassword;
-    const currentHash = user.password_hash;
-
-    // Detect hashing method based on hash format
-    // bcrypt hashes start with $2a$, $2b$, or $2y$
-    // SHA-256 hashes are 64 character hex strings
-    const isBcryptHash = currentHash && (currentHash.startsWith('$2a$') || 
-                                          currentHash.startsWith('$2b$') || 
-                                          currentHash.startsWith('$2y$'));
+    // ALWAYS use SHA-256 to match frontend
+    const hash = crypto.createHash('sha256');
+    hash.update(newPassword);
+    const hashedPassword = hash.digest('hex');
     
-    if (isBcryptHash) {
-      // Use bcrypt for old users
-      const saltRounds = 10;
-      hashedPassword = await bcrypt.hash(newPassword, saltRounds);
-      console.log('🔐 Password hashed with bcrypt for:', email);
-    } else {
-      // Use SHA-256 for new users (matching frontend)
-      const hash = crypto.createHash('sha256');
-      hash.update(newPassword);
-      hashedPassword = hash.digest('hex');
-      console.log('🔐 Password hashed with SHA-256 for:', email);
-    }
+    console.log('🔐 Password hashed with SHA-256');
+    console.log('📧 Email:', email);
+    console.log('📏 Hash length:', hashedPassword.length);
 
     // Update password in users table
     const { error: updateError } = await supabase
