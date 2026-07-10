@@ -668,6 +668,7 @@ app.post('/api/verify-code', async (req, res) => {
 
 // ─── RESET PASSWORD ──────────────────────────────────────────────────────
 // ─── RESET PASSWORD USING SUPABASE AUTH ADMIN ──────────────────────────
+// ─── RESET PASSWORD - SUPPORTING BOTH HASHING METHODS ────────────────
 app.post('/api/reset-password', async (req, res) => {
   try {
     const { email, code, newPassword } = req.body;
@@ -695,13 +696,10 @@ app.post('/api/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'Verification code has expired. Please request a new one.' });
     }
 
-    // ─── FIX: Update password using Supabase Auth Admin API ────────────
-    // This updates the password in Supabase Auth's secure storage
-    
-    // First, get the user ID from email
+    // Check what hashing method the user's current password uses
     const { data: user, error: userError } = await supabase
       .from('users')
-      .select('id')
+      .select('password_hash')
       .eq('email', email)
       .single();
 
@@ -710,51 +708,31 @@ app.post('/api/reset-password', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Update password using Supabase Auth Admin API
-    // Note: This requires the service_role key to work
-    const { data: authData, error: authError } = await supabase.auth.admin.updateUserById(
-      user.id,
-      { password: newPassword }
-    );
+    let hashedPassword;
+    const currentHash = user.password_hash;
 
-    if (authError) {
-      console.error('❌ Auth update error:', authError);
-      
-      // If admin API fails (may not be available), try alternative method
-      // Using the user's current session (if any) to update password
-      // This is a fallback
-      
-      // Try to sign in first to get a session
-      try {
-        // We need the old password, but we don't have it
-        // Instead, we can use the reset flow with a magic link
-        const { data: resetData, error: resetError } = await supabase.auth.resetPasswordForEmail(email);
-        
-        if (resetError) {
-          return res.status(500).json({ 
-            error: 'Failed to update password. Please try again or use the "Forgot Password" link on the login page.' 
-          });
-        }
-        
-        // Return success but inform user to check email
-        verificationCodes.delete(email);
-        return res.json({ 
-          success: true, 
-          message: 'Password reset link sent to your email. Please check your inbox to set a new password.',
-          needsEmailLink: true
-        });
-      } catch (fallbackError) {
-        return res.status(500).json({ error: 'Failed to update password. Please try again.' });
-      }
+    // Detect hashing method based on hash format
+    // bcrypt hashes start with $2a$, $2b$, or $2y$
+    // SHA-256 hashes are 64 character hex strings
+    const isBcryptHash = currentHash && (currentHash.startsWith('$2a$') || 
+                                          currentHash.startsWith('$2b$') || 
+                                          currentHash.startsWith('$2y$'));
+    
+    if (isBcryptHash) {
+      // Use bcrypt for old users
+      const saltRounds = 10;
+      hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+      console.log('🔐 Password hashed with bcrypt for:', email);
+    } else {
+      // Use SHA-256 for new users (matching frontend)
+      const hash = crypto.createHash('sha256');
+      hash.update(newPassword);
+      hashedPassword = hash.digest('hex');
+      console.log('🔐 Password hashed with SHA-256 for:', email);
     }
 
-    console.log('✅ Password updated in Supabase Auth for:', email);
-
-    // Also update the users table password_hash for consistency
-    const saltRounds = 10;
-    const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
-    
-    await supabase
+    // Update password in users table
+    const { error: updateError } = await supabase
       .from('users')
       .update({ 
         password_hash: hashedPassword,
@@ -762,6 +740,14 @@ app.post('/api/reset-password', async (req, res) => {
       })
       .eq('email', email);
 
+    if (updateError) {
+      console.error('❌ Failed to update password:', updateError);
+      return res.status(500).json({ error: 'Failed to update password' });
+    }
+
+    console.log('✅ Password updated successfully for:', email);
+
+    // Clean up
     verificationCodes.delete(email);
 
     res.json({ 
@@ -774,7 +760,6 @@ app.post('/api/reset-password', async (req, res) => {
     res.status(500).json({ error: 'Failed to reset password' });
   }
 });
-
 // ─── RESEND VERIFICATION CODE ────────────────────────────────────────────
 app.post('/api/resend-verification-code', async (req, res) => {
   try {
