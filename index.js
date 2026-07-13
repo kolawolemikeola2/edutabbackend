@@ -840,6 +840,174 @@ app.post('/api/resend-verification-code', async (req, res) => {
   }
 });
 
+
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// ─── GOHIGHLEVEL CRM WEBHOOK ───────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+const GHL_WEBHOOK_URL = 'https://services.leadconnectorhq.com/hooks/GCPxiOXBzKtJ1wEA9iGa/webhook-trigger/0cf0403a-1bd7-47b3-a797-ad243f1d0cef';
+
+// Function to send data to GoHighLevel
+async function sendToGoHighLevel(userData) {
+  try {
+    const payload = {
+      // User/ Parent info
+      parent_name: userData.full_name || '',
+      parent_email: userData.email || '',
+      parent_phone: userData.phone_number || '',
+      user_type: userData.user_type || 'parent',
+      
+      // Child info (if available at signup)
+      child_first_name: userData.child_name || '',
+      child_age: userData.child_age || '',
+      
+      // Location
+      country: userData.country || '',
+      
+      // School
+      school_name: userData.school_name || '',
+      
+      // Referral source
+      referral_source: userData.referral_source || '',
+      
+      // Device info
+      device_type: userData.device_type || '',
+      
+      // Plan info
+      current_plan: userData.plan_type || 'Free',
+      
+      // Registration date
+      registration_date: new Date().toISOString(),
+      
+      // Communication preference
+      preferred_communication: userData.communication_method || 'Email',
+      
+      // App info
+      app_name: 'Edutab',
+      source: 'Mobile App',
+    };
+
+    console.log('📤 Sending to GoHighLevel:', payload);
+
+    const response = await fetch(GHL_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (response.ok) {
+      console.log('✅ GoHighLevel webhook sent successfully');
+    } else {
+      console.error('❌ GoHighLevel webhook failed:', response.status);
+    }
+
+  } catch (error) {
+    console.error('❌ Error sending to GoHighLevel:', error.message);
+    // Don't throw - we don't want to break the signup flow
+  }
+}
+
+// ─── NEW ENDPOINT: Register user and send to CRM ────────────────────────
+app.post('/api/register-and-track', async (req, res) => {
+  try {
+    const userData = req.body;
+    
+    console.log('📝 New registration with CRM tracking:', userData.email);
+    
+    // Send to GoHighLevel in the background (don't wait for response)
+    sendToGoHighLevel(userData).catch(err => {
+      console.error('Background GHL error:', err);
+    });
+    
+    res.json({ 
+      success: true, 
+      message: 'Registration tracked successfully' 
+    });
+    
+  } catch (error) {
+    console.error('❌ Registration tracking error:', error);
+    res.status(500).json({ error: 'Failed to track registration' });
+  }
+});
+
+// ─── ENDPOINT: Just send data to CRM (for existing users, profile updates) ─
+app.post('/api/send-to-crm', async (req, res) => {
+  try {
+    const userData = req.body;
+    
+    console.log('📤 Sending existing user data to CRM:', userData.email);
+    
+    await sendToGoHighLevel(userData);
+    
+    res.json({ 
+      success: true, 
+      message: 'Data sent to CRM successfully' 
+    });
+    
+  } catch (error) {
+    console.error('❌ CRM send error:', error);
+    res.status(500).json({ error: 'Failed to send data to CRM' });
+  }
+});
+
+// ─── ENDPOINT: Test CRM webhook ──────────────────────────────────────────
+app.post('/api/test-crm-webhook', async (req, res) => {
+  try {
+    const testData = {
+      parent_name: 'Test Parent',
+      parent_email: 'test@example.com',
+      parent_phone: '+2348000000000',
+      user_type: 'parent',
+      child_first_name: 'Test Child',
+      child_age: '7',
+      country: 'Nigeria',
+      school_name: 'Test School',
+      referral_source: 'Facebook',
+      device_type: 'iPhone',
+      current_plan: 'Free',
+      registration_date: new Date().toISOString(),
+      preferred_communication: 'WhatsApp',
+      app_name: 'Edutab',
+      source: 'Mobile App - Test',
+    };
+
+    console.log('🧪 Sending test data to GoHighLevel...');
+    
+    const response = await fetch(GHL_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(testData),
+    });
+
+    const responseText = await response.text();
+    
+    console.log('📨 GHL Response:', response.status, responseText);
+
+    res.json({
+      success: response.ok,
+      status: response.status,
+      response: responseText,
+      message: response.ok ? 'Test successful!' : 'Test failed',
+    });
+
+  } catch (error) {
+    console.error('❌ Test error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+
+
+
 // ─── 404 HANDLER ────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
