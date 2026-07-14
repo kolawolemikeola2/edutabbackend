@@ -241,6 +241,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
 // ─── MIDDLEWARE ──────────────────────────────────────────────────────────
 app.use(express.json());
+app.use(cors());
 
 // ─── HEALTH CHECK ──────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
